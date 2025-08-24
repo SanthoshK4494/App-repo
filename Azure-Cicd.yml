@@ -1,0 +1,102 @@
+# azure-pipelines.yml
+trigger:
+  branches:
+    include: [ main, develop, feature/* ]
+
+variables:
+  vmImage: 'ubuntu-latest'
+  buildConfiguration: 'Release'
+  # Service connection & targets (configure in Project Settings → Service connections / Environments)
+  azureSubscription: 'sc-azure-spn'         # name of your Azure RM service connection
+  devAppService:   'myapp-dev-web'
+  testAppService:  'myapp-test-web'
+  prodAppService:  'myapp-prod-web'
+  appServiceRG:    'rg-webapps'
+
+stages:
+- stage: Build_Test
+  displayName: Build & Test
+  jobs:
+  - job: build
+    pool: { vmImage: $(vmImage) }
+    steps:
+    - checkout: self
+      clean: true
+
+    # .NET build & test (swap to npm/maven if you need)
+    - task: UseDotNet@2
+      inputs: { packageType: 'sdk', version: '8.x' }
+
+    - script: |
+        dotnet restore
+        dotnet build --configuration $(buildConfiguration) --no-restore
+        dotnet test  --configuration $(buildConfiguration) --no-build --logger trx
+      displayName: dotnet build & test
+
+    # Publish web artifact
+    - script: dotnet publish src/WebApp/WebApp.csproj -c $(buildConfiguration) -o $(Build.ArtifactStagingDirectory)
+      displayName: dotnet publish
+
+    - task: PublishBuildArtifacts@1
+      inputs:
+        pathToPublish: '$(Build.ArtifactStagingDirectory)'
+        artifactName: 'drop'
+
+- stage: Deploy_Dev
+  displayName: Deploy to DEV
+  dependsOn: Build_Test
+  jobs:
+  - deployment: dev
+    environment: 'dev-app'   # add approvals on this environment if you want
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - download: current
+            artifact: drop
+          - task: AzureWebApp@1
+            displayName: Deploy to App Service (DEV)
+            inputs:
+              azureSubscription: $(azureSubscription)
+              appName: $(devAppService)
+              package: '$(Pipeline.Workspace)/drop'
+
+- stage: Deploy_Test
+  displayName: Deploy to TEST
+  dependsOn: Deploy_Dev
+  condition: succeeded()
+  jobs:
+  - deployment: test
+    environment: 'test-app'  # gate/approvals configured on environment
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - download: current
+            artifact: drop
+          - task: AzureWebApp@1
+            displayName: Deploy to App Service (TEST)
+            inputs:
+              azureSubscription: $(azureSubscription)
+              appName: $(testAppService)
+              package: '$(Pipeline.Workspace)/drop'
+
+- stage: Deploy_Prod
+  displayName: Deploy to PROD
+  dependsOn: Deploy_Test
+  condition: succeeded()
+  jobs:
+  - deployment: prod
+    environment: 'prod-app'  # protect with approvals
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - download: current
+            artifact: drop
+          - task: AzureWebApp@1
+            displayName: Deploy to App Service (PROD)
+            inputs:
+              azureSubscription: $(azureSubscription)
+              appName: $(prodAppService)
+              package: '$(Pipeline.Workspace)/drop'
